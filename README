@@ -1,1 +1,22 @@
-httpcap - capture HTTP packets and save as files
+httpcap - multi-purpose HTTP re-constructor
+
+* Summary
+The httpcap will capture and/or re-construct HTTP/TCP stream,
+and create files which contain downloaded contents.
+
+* Supported and Unsupported Specification
+Following HTTP features will be handled:
+ - HTTP/1.1 request
+ - HTTP/1.1 responce
+ - HTTP/1.0 responce
+ - keep-alive
+ - chunked
+Following features have not been supported yet:
+ - gzip contents (will be saved without decoded)
+
+* Examples
+Commands below will create captured contents in a directory
+named 'http:/'
+ $ sudo ./httpcap -d eth0 -f 'port http'
+ $ find http://
+

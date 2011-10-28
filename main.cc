@@ -7,12 +7,21 @@
 #include <deque>
 #include <net/ethernet.h>
 #include <cstring>
+#include <string>
 #include <pcap/pcap.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+
+#include <iostream>
+using std::cerr;
+using std::endl;
 
 static const char *dev = "eth0";
 static int promiscuous = 0;
 static int count_packet = -1;
 static const char *filter = NULL;
+static const char *filename = NULL;
 
 #define LEN_ADDR 16
 
@@ -49,6 +58,37 @@ struct sock_s
 	}
 };
 
+template<typename container_t>
+int parse_string(container_t c, std::string &s, int start, int end, int last=0)
+{
+	while(start<end && last?(c[start]!=last):isspace(c[start]))
+		s.push_back(c[start++]);
+	return start;
+}
+
+static FILE * myfopenw(const char *name)
+{
+	char *s = new char[strlen(name)+10];
+	strcpy(s, name);
+	cerr<<"info: myfopenw("<<name<<")"<<endl;
+	char *p, *p1;
+	for(p=s; *p && (p1=strchr(p, '/')); p=p1+1) {
+		*p1 = 0;
+		//cerr<<" mkdir("<<s<<")"<<endl;
+		mkdir(s, 0755);
+		*p1 = '/';
+	}
+	FILE *fp;
+	for(int n=0; n<10; n++) {
+		fp = fopen(s, "w");
+		if(!fp) {
+			sprintf(s, "%s-%d", name, n);
+		}
+	}
+	delete[] s;
+	return fp;
+}
+
 struct tcp_stream_s
 {
 	struct sequence_s
@@ -59,41 +99,247 @@ struct tcp_stream_s
 			state_fin
 		} state;
 		std::deque <u_char> data;
-		int seq_first, seq_offset;
+		int seq_first, seq_offset, seq_ack;
+
+		const u_char &operator [] (int s) const {
+			return data[s-seq_offset];
+		}
 
 		void syn(int seq) {
 			state = state_est;
-			seq_first = seq_offset = seq+1;
+			seq_first = seq_offset = seq_ack = seq+1;
 		}
 		void update(int seq, int len, const u_char *dat) {
 			int size_1 = seq-seq_offset + len;
-			data.resize(size_1);
+			if(data.size()<size_1)
+				data.resize(size_1);
+			//else cerr<<"debug: data.size="<<data.size()<<" size_1="<<size_1<<endl;
 			for(int i=0, j=seq-seq_offset; i<len; i++, j++)
 				if(j>=0)
 					data[j] = dat[i];
 		}
+		void ack(int seq) {
+			if((seq-seq_ack)>0) {
+				if(seq_ack-seq_offset > data.size()) {
+					fprintf(stderr, "warning: packet dropped: data lost seq: %u to %u\n",
+							seq_offset+data.size(), seq_ack );
+				}
+				seq_ack = seq;
+			}
+		}
 		void fin() {
 			state = state_fin;
+		}
+		void advance(int seq) {
+			int size = seq - seq_offset;
+			cerr<<"  advance size="<<size<<endl;
+			if(0<size && size<=data.size()) {
+				seq_offset = seq;
+				data.erase(data.begin(), data.begin()+size);
+			}
+			else if(data.size()<size) {
+				cerr<<"debug: advance size="<<size<<" data-size="<<data.size()<<endl;
+				seq_offset = seq;
+				data.clear();
+			}
 		}
 	};
 
 	sequence_s up, down;
 
+	enum http_state_e {
+		http_init,
+		http_11_get,
+		http_10_data,
+		http_11_data,
+		http_parsed,
+		http_unknown,
+	} http_state;
+	std::string url;
+	long long content_length;
+	bool keep_alive;
+	bool chunked;
+	FILE *fp;
+	long long position;
+
+	void init_http_state() {
+		http_state = http_init;
+		content_length = -1;
+		keep_alive = 0;
+		chunked = 0;
+		position = 0;
+		if(fp) fclose(fp); fp = NULL;
+	}
+
+	tcp_stream_s() {
+		fp = NULL;
+		init_http_state();
+	}
+
 	void doit() {
-		if(up.state==sequence_s::state_fin && down.state==sequence_s::state_fin) {
+		if(up.state==sequence_s::state_fin && down.state==sequence_s::state_fin && http_state!=http_parsed) {
 			static int id = 0;
 			char name[64];
-			sprintf(name, "/tmp/http%04d-up.dat", id);
+			sprintf(name, "/tmp/http-%04d-up.dat", id);
 			FILE *fp = fopen(name, "w");
 			for(int i=0; i<up.data.size(); i++)
 				fputc(up.data[i], fp);
 			fclose(fp);
-			sprintf(name, "/tmp/http%04d-down.dat", id);
+			sprintf(name, "/tmp/http-%04d-down.dat", id);
 			fp = fopen(name, "w");
 			for(int i=0; i<down.data.size(); i++)
 				fputc(down.data[i], fp);
 			fclose(fp);
 			id++;
+		}
+
+		if(http_state==http_init) {
+			parse_request();
+		}
+		if(http_state==http_11_get) {
+			parse_11_response();
+		}
+		if(http_state==http_10_data || http_state==http_11_data) {
+			parse_data();
+		}
+	}
+
+	void parse_data() {
+		if(!fp) {
+			fp = myfopenw(url.c_str());
+		}
+
+		if(content_length>=0) {
+			int size = 0;
+			int seq = down.seq_offset;
+			cerr<<" content_length="<<content_length<<" seq="<<seq<<" ack="<<down.seq_ack<<endl;
+			for(; content_length>position && (down.seq_ack-seq)>0; ) {
+				if(fp) fputc(down[seq], fp);
+				size++;
+				position++;
+				seq++;
+			}
+			if(size) {
+				down.advance(seq);
+			}
+			if(content_length==position) {
+				if(fp) fclose(fp); fp = NULL;
+				http_state = http_parsed;
+			}
+		}
+		else if(chunked) {
+			int seq = down.seq_offset;
+			std::string s_size;
+			seq = parse_string(down, s_size, seq, down.seq_ack, '\r');
+			if(down[seq]=='\r' && down[seq+1]=='\n') {
+				seq += 2;
+				int size = strtol(s_size.c_str(), NULL, 16);
+				if(size==0) {
+					if(fp) fclose(fp); fp = NULL;
+					http_state = http_parsed;
+				}
+				else if(down.seq_ack-seq >= size+2) {
+					for(int i=0; i<size && seq!=down.seq_ack; i++) {
+						if(fp) fputc(down[seq], fp);
+						position++;
+						seq++;
+					}
+					if(down[seq]=='\r' && down[seq+1]=='\n') {
+						seq += 2;
+					}
+					down.advance(seq);
+				}
+			}
+		}
+
+		if(http_state==http_parsed && keep_alive)
+			init_http_state();
+	}
+
+	void parse_11_response() {
+		int end=down.seq_offset;
+		for(int i=end, j=0; i!=down.seq_ack; i++) {
+			const u_char term[]="\r\n\r\n";
+			if(j==4) {
+				end = i-j;
+				cerr<<" end found: length="<<(end-down.seq_offset)<<endl;
+				break;
+			}
+			else if(down[i]==term[j])
+				j++;
+			else
+				j = 0;
+		}
+		if(end != down.seq_offset) {
+			std::string http_ver, s_code, status;
+			int seq = down.seq_offset;
+			seq = parse_string(down, http_ver, seq, down.seq_ack, ' ')+1;
+			seq = parse_string(down, s_code  , seq, down.seq_ack, ' ')+1;
+			seq = parse_string(down, status  , seq, down.seq_ack, '\r')+2;
+			int code = atoi(s_code.c_str());
+			cerr<<" ver=["<<http_ver<<"] code="<<code<<" data[0]="<<(char)down.data[0]<<endl;
+			for(; (end-seq)>0 && down[seq]!='\r'; ) {
+				std::string a, b;
+				seq = parse_string(down, a, seq, down.seq_ack, ':')+2;
+				seq = parse_string(down, b, seq, down.seq_ack, '\r')+2;
+				cerr<<" a=["<<a<<"] b=["<<b<<"]"<<endl;
+				if(a=="Content-Length")
+					content_length = atoll(b.c_str());
+				else if(a=="Connection" && b=="keep-alive")
+					keep_alive = 1;
+				else if(a=="Transfer-Encoding" && b=="chunked")
+					chunked = 1;
+			}
+			if(http_ver=="HTTP/1.0" && code==200) {
+				http_state = http_10_data;
+				down.advance(end+4);
+			}
+			else if(http_ver=="HTTP/1.1" && code==200) {
+				http_state = http_11_data;
+				down.advance(end+4);
+			}
+			else {
+				http_state = http_unknown;
+			}
+		}
+	}
+
+	void parse_request() {
+		int end=up.seq_offset;
+		for(int i=end, j=0; i!=up.seq_ack; i++) {
+			const u_char term[]="\r\n\r\n";
+			if(j==4) {
+				end = i-j;
+				break;
+			}
+			else if(up[i]==term[j])
+				j++;
+			else
+				j = 0;
+		}
+		if(end != up.seq_offset) {
+			std::string method, path, http_ver, host;
+			int seq = up.seq_offset;
+			seq = parse_string(up, method, seq, up.seq_ack, ' ')+1;
+			seq = parse_string(up, path, seq, up.seq_ack, ' ')+1;
+			seq = parse_string(up, http_ver, seq, up.seq_ack, '\r')+2;
+			cerr<<" method=["<<method<<"] path=["<<path<<"]"<<endl;
+			for(; (end-seq)>0 && up[seq]!='\r'; ) {
+				std::string a, b;
+				seq = parse_string(up, a, seq, up.seq_ack, ':')+2;
+				seq = parse_string(up, b, seq, up.seq_ack, '\r')+2;
+				cerr<<" a=["<<a<<"] b=["<<b<<"]"<<endl;
+				if(a=="Host")
+					host = b;
+			}
+			if(method=="GET" && http_ver=="HTTP/1.1") {
+				http_state = http_11_get;
+				up.advance(end+4);
+				url = "http://" + host + path;
+				cerr<<"url=["<<url<<"]"<<endl;
+			}
+			else
+				http_state = http_unknown;
 		}
 	}
 };
@@ -105,6 +351,7 @@ static void do_tcp(const struct pcap_pkthdr *h, const addr_s &addr_from, const a
 	int port_from = (bytes[0]<<8) | bytes[1];
 	int port_to = (bytes[2]<<8) | bytes[3];
 	int sequence = (bytes[4]<<24) | (bytes[5]<<16) | (bytes[6]<<8) | bytes[7];
+	int ackno = (bytes[8]<<24) | (bytes[9]<<16) | (bytes[10]<<8) | bytes[11];
 	int length_header = (bytes[12]>>4)*4;
 	int flags = bytes[13]&0x3F;
 	printf(" TCP from=%d to=%d seq=%d len_h=%d flags=%x len_d=%d\n",
@@ -129,6 +376,8 @@ static void do_tcp(const struct pcap_pkthdr *h, const addr_s &addr_from, const a
 	else if(tcp_streams.count(pair_up)) {
 		tcp_stream_s &tcp = tcp_streams[pair_up];
 		tcp.up.update(sequence, length-length_header, bytes+length_header);
+		if(flags & 0x10)
+			tcp.down.ack(ackno);
 		if(flags & 0x01)
 			tcp.up.fin();
 		tcp.doit();
@@ -136,6 +385,8 @@ static void do_tcp(const struct pcap_pkthdr *h, const addr_s &addr_from, const a
 	else if(tcp_streams.count(pair_down)) {
 		tcp_stream_s &tcp = tcp_streams[pair_down];
 		tcp.down.update(sequence, length-length_header, bytes+length_header);
+		if(flags & 0x10)
+			tcp.up.ack(ackno);
 		if(flags & 0x01)
 			tcp.down.fin();
 		tcp.doit();
@@ -202,6 +453,14 @@ main(int argc, char **argv)
 					return (int)c;
 				}
 				break;
+			case 'r':
+				if(i<argc)
+					filename = argv[i++];
+				else {
+					fprintf(stderr, "error: option -%c requires extra arguments\n", c);
+					return (int)c;
+				}
+				break;
 			case 'f':
 				if(i<argc)
 					filter = argv[i++];
@@ -219,23 +478,36 @@ main(int argc, char **argv)
 			return 2;
 		}
 	}
-	char errbuf[PCAP_ERRBUF_SIZE];
 
-	memset(errbuf, 0, sizeof(errbuf));
-	pcap_t *cap = pcap_open_live(dev, 32768, promiscuous, 4000, errbuf);
-	if(errbuf[0])
-		fprintf(stderr, "%s\n", errbuf);
-	if(!cap)
-		return __LINE__;
+	pcap_t *cap;
+
+	if(filename) {
+		char errbuf[PCAP_ERRBUF_SIZE];
+		memset(errbuf, 0, sizeof(errbuf));
+		cap = pcap_open_offline(filename, errbuf);
+		if(errbuf[0])
+			fprintf(stderr, "%s\n", errbuf);
+		if(!cap)
+			return __LINE__;
+	}
+	else {
+		char errbuf[PCAP_ERRBUF_SIZE];
+		memset(errbuf, 0, sizeof(errbuf));
+		cap = pcap_open_live(dev, 32768, promiscuous, 4000, errbuf);
+		if(errbuf[0])
+			fprintf(stderr, "%s\n", errbuf);
+		if(!cap)
+			return __LINE__;
+	}
 
 	if(filter) {
 		struct bpf_program prog;
 		if(pcap_compile(cap, &prog, filter, 1, PCAP_NETMASK_UNKNOWN)) {
-			pcap_perror(cap, "pcap_compile");
+			pcap_perror(cap, (char*)"pcap_compile");
 			return __LINE__;
 		}
 		if(pcap_setfilter(cap, &prog)) {
-			pcap_perror(cap, "pcap_setfilter");
+			pcap_perror(cap, (char*)"pcap_setfilter");
 			return __LINE__;
 		}
 	}
