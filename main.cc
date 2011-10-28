@@ -82,8 +82,8 @@ static FILE * myfopenw(const char *name)
 		mkdir(s, 0755);
 		*p1 = '/';
 	}
-	FILE *fp;
-	for(int n=0; n<10; n++) {
+	FILE *fp=NULL;
+	for(int n=0; !fp && n<10; n++) {
 		fp = fopen(s, "w");
 		if(!fp) {
 			sprintf(s, "%s-%d", name, n);
@@ -107,8 +107,12 @@ struct tcp_stream_s
 		std::deque <u_char> data;
 		int seq_first, seq_offset, seq_ack;
 
-		const u_char &operator [] (int s) const {
-			return data[s-seq_offset];
+		u_char operator [] (int s) const {
+			int x = s-seq_offset;
+			if(0<=x && x<data.size())
+				return data[x];
+			else
+				return 0;
 		}
 
 		void syn(int seq) {
@@ -138,7 +142,7 @@ struct tcp_stream_s
 		}
 		void advance(int seq) {
 			int size = seq - seq_offset;
-			cerr<<"  advance size="<<size<<endl;
+			//cerr<<"  advance size="<<size<<endl;
 			if(0<size && size<=data.size()) {
 				seq_offset = seq;
 				data.erase(data.begin(), data.begin()+size);
@@ -182,6 +186,10 @@ struct tcp_stream_s
 	tcp_stream_s() {
 		fp = NULL;
 		init_http_state();
+	}
+
+	~tcp_stream_s() {
+		if(fp) fclose(fp); fp=NULL;
 	}
 
 	void doit() {
@@ -262,6 +270,13 @@ struct tcp_stream_s
 				}
 			}
 		}
+		else {
+			while(down.seq_offset!=down.seq_ack) {
+				fputc(down[down.seq_offset], fp);
+				down.advance(down.seq_offset+1);
+				position++;
+			}
+		}
 
 		if(http_state==http_parsed && keep_alive) {
 			cerr<<"debug: port="<<socks.first.port<<" reset HTTP parser because of keep-alive"<<endl;
@@ -285,7 +300,6 @@ struct tcp_stream_s
 				j = 0;
 		}
 		cerr<<" parse_11_response: end:"<<end-down.seq_offset<<" ack="<<down.seq_ack-down.seq_offset<<endl;
-		if(down.seq_ack-end>=4) { cerr<<"   last:"; for(int i=down.seq_ack-4; i!=down.seq_ack; i++) cerr<<' '<<hex<<(int)down[i]; cerr<<dec<<endl; }
 		if(end != down.seq_offset) {
 			std::string http_ver, s_code, status;
 			int seq = down.seq_offset;
@@ -298,7 +312,6 @@ struct tcp_stream_s
 				std::string a, b;
 				seq = parse_string(down, a, seq, down.seq_ack, ':')+2;
 				seq = parse_string(down, b, seq, down.seq_ack, '\r')+2;
-				cerr<<" port="<<socks.first.port<<" a=["<<a<<"] b=["<<b<<"]"<<endl;
 				if(a=="Content-Length")
 					content_length = atoll(b.c_str());
 				else if(a=="Connection" && b=="keep-alive")
@@ -306,15 +319,23 @@ struct tcp_stream_s
 				else if(a=="Transfer-Encoding" && b=="chunked")
 					chunked = 1;
 			}
-			if(http_ver=="HTTP/1.0" && code/100==2) {
-				cerr<<"debug: port="<<socks.first.port<<" parser: HTTP/1.0 receiver"<<endl;
-				http_state = http_10_data;
-				down.advance(end+4);
+			if(http_ver=="HTTP/1.0") {
+				if(code/100==2) {
+					cerr<<"debug: port="<<socks.first.port<<" parser: HTTP/1.0 receiver"<<endl;
+					http_state = http_10_data;
+					down.advance(end+4);
+				}
+				else if(keep_alive)
+					init_http_state();
 			}
-			else if(http_ver=="HTTP/1.1" && code/100==2) {
-				cerr<<"debug: port="<<socks.first.port<<" parser: HTTP/1.1 receiver"<<endl;
-				http_state = http_11_data;
-				down.advance(end+4);
+			else if(http_ver=="HTTP/1.1") {
+				if(code/100==2) {
+					cerr<<"debug: port="<<socks.first.port<<" parser: HTTP/1.1 receiver"<<endl;
+					http_state = http_11_data;
+					down.advance(end+4);
+				}
+				else if(keep_alive)
+					init_http_state();
 			}
 			else {
 				http_state = http_unknown;
@@ -340,9 +361,9 @@ struct tcp_stream_s
 			else
 				j = 0;
 		}
-		cerr<<" parse_request: end:"<<end-up.seq_offset<<" ack="<<up.seq_ack-up.seq_offset<<endl;
-		if(up.seq_ack-end>=4) { cerr<<"  first:"; for(int i=up.seq_offset,j=0; j<4; i++, j++) cerr<<' '<<hex<<(int)up[i]; cerr<<dec<<endl; }
-		if(up.seq_ack-end>=4) { cerr<<"   last:"; for(int i=up.seq_ack-4; i!=up.seq_ack; i++) cerr<<' '<<hex<<(int)up[i]; cerr<<dec<<endl; }
+		//cerr<<" parse_request: end:"<<end-up.seq_offset<<" ack="<<up.seq_ack-up.seq_offset<<endl;
+		//if(up.seq_ack-end>=4) { cerr<<"  first:"; for(int i=up.seq_offset,j=0; j<4; i++, j++) cerr<<' '<<hex<<(int)up[i]; cerr<<dec<<endl; }
+		//if(up.seq_ack-end>=4) { cerr<<"   last:"; for(int i=up.seq_ack-4; i!=up.seq_ack; i++) cerr<<' '<<hex<<(int)up[i]; cerr<<dec<<endl; }
 		if(end != up.seq_offset) {
 			std::string method, path, http_ver, host;
 			int seq = up.seq_offset;
@@ -354,7 +375,7 @@ struct tcp_stream_s
 				std::string a, b;
 				seq = parse_string(up, a, seq, up.seq_ack, ':')+2;
 				seq = parse_string(up, b, seq, up.seq_ack, '\r')+2;
-				cerr<<" port="<<socks.first.port<<" a=["<<a<<"] b=["<<b<<"]"<<endl;
+				//cerr<<" port="<<socks.first.port<<" a=["<<a<<"] b=["<<b<<"]"<<endl;
 				if(a=="Host")
 					host = b;
 			}
@@ -383,6 +404,7 @@ static void do_tcp(const struct pcap_pkthdr *h, const addr_s &addr_from, const a
 	int ackno = (bytes[8]<<24) | (bytes[9]<<16) | (bytes[10]<<8) | bytes[11];
 	int length_header = (bytes[12]>>4)*4;
 	int flags = bytes[13]&0x3F;
+	/*
 	printf(" TCP from=%d to=%d seq=%d len_h=%d flags=%x len_d=%d  ",
 			port_from, port_to,
 			sequence, length_header,
@@ -390,6 +412,7 @@ static void do_tcp(const struct pcap_pkthdr *h, const addr_s &addr_from, const a
 			length-length_header );
 	for(int i=length_header, j=0; i<length && j<64; i++, j++) putchar(isprint(bytes[i]) ?  bytes[i] : '.');
 	puts("");
+	*/
 
 	sock_s sock_from(addr_from, port_from);
 	sock_s sock_to  (addr_to  , port_to  );
