@@ -16,7 +16,9 @@ Following features have not been supported yet:
 
 * Examples
 Commands below will create captured contents in a directory
-named 'http:/'
+named 'http/'
  $ sudo ./httpcap -d eth0 -f 'port http'
- $ find http://
+ $ find http/
 
+* Known Bugs
+ - last part of image from wikipedia always lost.

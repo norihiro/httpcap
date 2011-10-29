@@ -26,6 +26,7 @@ static int count_packet = -1;
 static const char *filter = NULL;
 static const char *filename = NULL;
 static int buffer_size = 8192;
+static int timeout_tcp = 60*4;
 
 static const char* getdomain(const char *s)
 {
@@ -87,6 +88,19 @@ int parse_string(container_t c, std::string &s, int start, int end, int last=0)
 	return start;
 }
 
+const char * get_content_types(const std::string &ct)
+{
+	if(ct=="text/plain") { return "txt"; }
+	if(ct=="text/html") { return "html"; }
+	if(ct=="text/css") { return "css"; }
+	if(ct=="video/x-flv") { return "flv"; }
+	if(ct=="image/png") { return "png"; }
+	if(ct=="image/gif") { return "gif"; }
+	if(ct=="image/jpeg") { return "jpeg"; }
+	if(ct=="audio/mpeg") { return "mp3"; }
+	return NULL;
+}
+
 static FILE * myfopenw(const char *name)
 {
 	char *s = new char[strlen(name)+10];
@@ -110,6 +124,11 @@ static FILE * myfopenw(const char *name)
 		perror("fopen");
 	delete[] s;
 	return fp;
+}
+
+time_t operator - (const struct timeval &a, const struct timeval &b)
+{
+	return (a.tv_sec-b.tv_sec) + (a.tv_usec-b.tv_usec)/1000/1000;
 }
 
 struct tcp_stream_s
@@ -174,6 +193,8 @@ struct tcp_stream_s
 
 	sequence_s up, down;
 	std::pair<sock_s,sock_s> socks;
+
+	struct timeval ts_start, ts_last;
 
 	enum http_state_e {
 		http_init,
@@ -341,6 +362,12 @@ struct tcp_stream_s
 					keep_alive = 1;
 				else if(a=="Transfer-Encoding" && b=="chunked")
 					chunked = 1;
+				else if(a=="Content-Type") {
+					if(const char *s = get_content_types(b))
+						(filename += ".") += s;
+					else
+						filename += ".dat";
+				}
 			}
 			if(http_ver=="HTTP/1.0") {
 				if(code==200) {
@@ -414,8 +441,7 @@ struct tcp_stream_s
 					host = b;
 			}
 			if(method=="GET" && http_ver=="HTTP/1.1") {
-				static int id=0;
-				char s[16]; sprintf(s, "%08d.dat", id++);
+				char s[24]; sprintf(s, "%d-%06d", (int)ts_last.tv_sec, (int)ts_last.tv_usec);
 				http_state = http_11_get;
 				up.advance(end+4);
 				url = "http://" + host + path;
@@ -428,7 +454,8 @@ struct tcp_stream_s
 	}
 };
 
-std::map<std::pair<sock_s,sock_s>, tcp_stream_s> tcp_streams;
+typedef std::map<std::pair<sock_s,sock_s>, tcp_stream_s> tcp_streams_t;
+tcp_streams_t tcp_streams;
 
 static void do_tcp(const struct pcap_pkthdr *h, const addr_s &addr_from, const addr_s &addr_to, int length, const u_char *bytes)
 {
@@ -457,10 +484,14 @@ static void do_tcp(const struct pcap_pkthdr *h, const addr_s &addr_from, const a
 		tcp_stream_s &tcp = tcp_streams[pair_up];
 		tcp.socks = pair_up;
 		tcp.up.syn(sequence);
+		tcp.ts_start = h->ts;
+		tcp.ts_last = h->ts;
 	}
 	else if(flags==0x12) {
 		tcp_stream_s &tcp = tcp_streams[pair_down];
 		tcp.down.syn(sequence);
+		tcp.ts_start = h->ts;
+		tcp.ts_last = h->ts;
 	}
 	else if(tcp_streams.count(pair_up)) {
 		tcp_stream_s &tcp = tcp_streams[pair_up];
@@ -470,6 +501,7 @@ static void do_tcp(const struct pcap_pkthdr *h, const addr_s &addr_from, const a
 		if(flags & 0x01)
 			tcp.up.fin();
 		tcp.doit();
+		tcp.ts_last = h->ts;
 	}
 	else if(tcp_streams.count(pair_down)) {
 		tcp_stream_s &tcp = tcp_streams[pair_down];
@@ -479,8 +511,15 @@ static void do_tcp(const struct pcap_pkthdr *h, const addr_s &addr_from, const a
 		if(flags & 0x01)
 			tcp.down.fin();
 		tcp.doit();
+		tcp.ts_last = h->ts;
 	}
 
+	for(tcp_streams_t::iterator it=tcp_streams.begin(); it!=tcp_streams.end(); it++) {
+		if((h->ts-it->second.ts_last) > timeout_tcp) {
+			tcp_streams.erase(it);
+			break;
+		}
+	}
 }
 
 static void do_ipv4(const struct pcap_pkthdr *h, int length, const u_char *bytes)
