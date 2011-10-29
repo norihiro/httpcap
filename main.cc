@@ -8,6 +8,7 @@
 #include <net/ethernet.h>
 #include <cstring>
 #include <string>
+#include <algorithm>
 #include <pcap/pcap.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -25,6 +26,22 @@ static int count_packet = -1;
 static const char *filter = NULL;
 static const char *filename = NULL;
 static int buffer_size = 8192;
+
+static const char* getdomain(const char *s)
+{
+	int len = strlen(s);
+	int c=2;
+	const char *p=s+len;
+	for(int i=0; i<len; i++, p--) if(s[len-i-1]=='.') {
+		c--;
+		if(c==0)
+			return p;
+		if(i==2) {
+			c++;
+		}
+	}
+	return s;
+}
 
 #define LEN_ADDR 16
 
@@ -198,14 +215,18 @@ struct tcp_stream_s
 			char name[64];
 			sprintf(name, "/tmp/http-%04d-up.dat", id);
 			FILE *fp = fopen(name, "w");
-			for(int i=0; i<up.data.size(); i++)
-				fputc(up.data[i], fp);
-			fclose(fp);
+			if(fp) {
+				for(int i=0; i<up.data.size(); i++)
+					fputc(up.data[i], fp);
+				fclose(fp);
+			}
 			sprintf(name, "/tmp/http-%04d-down.dat", id);
 			fp = fopen(name, "w");
-			for(int i=0; i<down.data.size(); i++)
-				fputc(down.data[i], fp);
-			fclose(fp);
+			if(fp) {
+				for(int i=0; i<down.data.size(); i++)
+					fputc(down.data[i], fp);
+				fclose(fp);
+			}
 			id++;
 		}
 
@@ -228,14 +249,16 @@ struct tcp_stream_s
 		if(content_length>=0) {
 			int size = 0;
 			int seq = down.seq_offset;
-			cerr<<" content_length="<<content_length<<" seq="<<seq<<" ack="<<down.seq_ack<<endl;
-			for(; content_length>position && (down.seq_ack-seq)>0; ) {
-				if(fp) fputc(down[seq], fp);
-				size++;
-				position++;
-				seq++;
+			//cerr<<" content_length="<<content_length<<" seq="<<seq<<" ack="<<down.seq_ack<<endl;
+			size = std::min((int)(content_length-position), down.seq_ack-seq);
+			if(size>0) {
+				//cerr<<" buf size="<<size<<endl;
+				std::vector<u_char> buf(size); for(int i=0; i<size; i++) buf[i]=down[seq++];
+				if(fp) fwrite(&buf[0], size, 1, fp);
+				position += size;
 			}
 			if(size) {
+				//cerr<<"calling advance seq="<<seq<<endl;
 				down.advance(seq);
 			}
 			if(content_length==position && down.seq_ack-seq>=2) {
@@ -307,7 +330,7 @@ struct tcp_stream_s
 			seq = parse_string(down, s_code  , seq, down.seq_ack, ' ')+1;
 			seq = parse_string(down, status  , seq, down.seq_ack, '\r')+2;
 			int code = atoi(s_code.c_str());
-			cerr<<" ver=["<<http_ver<<"] code="<<code<<" data[0]="<<(char)down.data[0]<<endl;
+			cerr<<"debug: port="<<socks.first.port<<" ver=["<<http_ver<<"] code="<<code<<" data[0]="<<(char)down.data[0]<<endl;
 			for(; (end-seq)>0 && down[seq]!='\r'; ) {
 				std::string a, b;
 				seq = parse_string(down, a, seq, down.seq_ack, ':')+2;
@@ -320,22 +343,29 @@ struct tcp_stream_s
 					chunked = 1;
 			}
 			if(http_ver=="HTTP/1.0") {
-				if(code/100==2) {
+				if(code==200) {
 					cerr<<"debug: port="<<socks.first.port<<" parser: HTTP/1.0 receiver"<<endl;
 					http_state = http_10_data;
 					down.advance(end+4);
 				}
-				else if(keep_alive)
+				else if(keep_alive) {
+					down.advance(end+4);
 					init_http_state();
+				}
+				else {
+					down.advance(end+4);
+				}
 			}
 			else if(http_ver=="HTTP/1.1") {
-				if(code/100==2) {
+				if(code==200) {
 					cerr<<"debug: port="<<socks.first.port<<" parser: HTTP/1.1 receiver"<<endl;
 					http_state = http_11_data;
 					down.advance(end+4);
 				}
-				else if(keep_alive)
+				else {
+					down.advance(end+4);
 					init_http_state();
+				}
 			}
 			else {
 				http_state = http_unknown;
@@ -350,6 +380,10 @@ struct tcp_stream_s
 		//	up.advance(up.seq_offset+1);
 		int end=up.seq_offset;
 		for(int i=end, j=0; i!=up.seq_ack; i++) {
+			if(i-end>65536) {
+				cerr<<"error: HTTP request not found"<<endl;
+				http_state = http_unknown;
+			}
 			const u_char term[]="\r\n\r\n";
 			if(up[i]==term[j]) {
 				j++;
@@ -370,7 +404,7 @@ struct tcp_stream_s
 			seq = parse_string(up, method, seq, up.seq_ack, ' ')+1;
 			seq = parse_string(up, path, seq, up.seq_ack, ' ')+1;
 			seq = parse_string(up, http_ver, seq, up.seq_ack, '\r')+2;
-			cerr<<" port="<<socks.first.port<<"  method=["<<method<<"] path=["<<path<<"]"<<endl;
+			cerr<<"debug: port="<<socks.first.port<<"  method=["<<method<<"] path=["<<path<<"]"<<endl;
 			for(; (end-seq)>0 && up[seq]!='\r'; ) {
 				std::string a, b;
 				seq = parse_string(up, a, seq, up.seq_ack, ':')+2;
@@ -385,7 +419,7 @@ struct tcp_stream_s
 				http_state = http_11_get;
 				up.advance(end+4);
 				url = "http://" + host + path;
-				filename = "http/" + host + "/" + s;
+				filename = std::string("http/") + getdomain(host.c_str()) + "/" + s;
 				cerr<<"url=["<<url<<"] filename="<<filename<<endl;
 			}
 			else
